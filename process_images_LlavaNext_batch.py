@@ -124,7 +124,8 @@ class LlavaNextDescriptor:
 
         self.model = (
             LlavaNextForConditionalGeneration.from_pretrained(
-                "llava-hf/llava-v1.6-mistral-7b-hf", torch_dtype=torch.float16
+                "llava-hf/llava-v1.6-mistral-7b-hf",
+                torch_dtype=torch.float16,
             )
             .cuda()
             .eval()
@@ -211,7 +212,7 @@ class LlavaNextDescriptor:
         decoded = self.processor.batch_decode(outputs, skip_special_tokens=True)
         decoded_clean = []
         generated_tokens = 0
-        for i in range(self.batch_size):
+        for i in range(len(prompt)):
             generated_tokens += outputs[i].shape[0]
             decoded_clean.append(decoded[i].strip())
         return decoded_clean, generated_tokens
@@ -350,6 +351,8 @@ class LlavaNextDescriptor:
             images = []
             prompts = []
             for _ in range(self.batch_size):
+                if self.threaded_image_reader.is_iq_empty():
+                    break
                 key, image = self.threaded_image_reader.image_queue.get()
                 keys.append(key)
                 images.append(image)

@@ -1,4 +1,6 @@
-from transformers import InstructBlipProcessor, InstructBlipForConditionalGeneration
+from torchvision.transforms.functional import InterpolationMode
+from transformers import AutoTokenizer, AutoModel
+import torchvision.transforms as T
 from typing import Tuple, List
 from PIL import Image
 import threading
@@ -9,16 +11,99 @@ import copy
 import time
 import os
 
-model_config = {
-    "do_sample": False,
-    "num_beams": 5,
-    "max_length": 512,
-    "min_length": 1,
-    "top_p": 0.9,
-    "repetition_penalty": 1.5,
-    "length_penalty": 1.0,
-    "temperature": 1,
-}
+model_config = dict(
+    num_beams=1,
+    max_new_tokens=512,
+    do_sample=False,
+)
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def build_transform(input_size):
+    MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
+    transform = T.Compose(
+        [
+            T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=MEAN, std=STD),
+        ]
+    )
+    return transform
+
+
+def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+    best_ratio_diff = float("inf")
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_ratio = ratio
+        elif ratio_diff == best_ratio_diff:
+            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                best_ratio = ratio
+    return best_ratio
+
+
+def dynamic_preprocess(
+    image, min_num=1, max_num=6, image_size=448, use_thumbnail=False
+):
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+
+    # calculate the existing image aspect ratio
+    target_ratios = set(
+        (i, j)
+        for n in range(min_num, max_num + 1)
+        for i in range(1, n + 1)
+        for j in range(1, n + 1)
+        if i * j <= max_num and i * j >= min_num
+    )
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+    # find the closest aspect ratio to the target
+    target_aspect_ratio = find_closest_aspect_ratio(
+        aspect_ratio, target_ratios, orig_width, orig_height, image_size
+    )
+
+    # calculate the target width and height
+    target_width = image_size * target_aspect_ratio[0]
+    target_height = image_size * target_aspect_ratio[1]
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+    # resize the image
+    resized_img = image.resize((target_width, target_height))
+    processed_images = []
+    for i in range(blocks):
+        box = (
+            (i % (target_width // image_size)) * image_size,
+            (i // (target_width // image_size)) * image_size,
+            ((i % (target_width // image_size)) + 1) * image_size,
+            ((i // (target_width // image_size)) + 1) * image_size,
+        )
+        # split the image
+        split_img = resized_img.crop(box)
+        processed_images.append(split_img)
+    assert len(processed_images) == blocks
+    if use_thumbnail and len(processed_images) != 1:
+        thumbnail_img = image.resize((image_size, image_size))
+        processed_images.append(thumbnail_img)
+    return processed_images
+
+
+def load_image(image, input_size=448, max_num=6):
+    transform = build_transform(input_size=input_size)
+    images = dynamic_preprocess(
+        image, image_size=input_size, use_thumbnail=True, max_num=max_num
+    )
+    pixel_values = [transform(image) for image in images]
+    pixel_values = torch.stack(pixel_values)
+    return pixel_values
 
 
 class ThreadedImageReader(threading.Thread):
@@ -83,20 +168,21 @@ class ThreadedImageReader(threading.Thread):
         while True:
             key, image_path = self.path_queue.get()
             image = Image.open(image_path).convert("RGB")
-            self.image_queue.put((key, image))
+            pixel_values = load_image(image, max_num=6).to(torch.bfloat16)
+            self.image_queue.put((key, pixel_values))
             # Signals to queue job is done
             self.image_queue.task_done()
 
 
-class InstructBlipDescriptor:
+class InternVL15Descriptor:
     def __init__(
         self,
-        db_path: str = "descriptions_instruct_blip.pkl",
+        db_path: str = "descriptions_internvl15.pkl",
         log_interval: int = 100,
         model_config: dict = model_config,
     ) -> None:
         """
-        Initialize the InstructBlipDescriptor with the specified database path, log interval and model configuration.
+        Initialize the InternVL15Descriptor with the specified database path, log interval and model configuration.
 
         Args:
             db_path (str): The path to the database file.
@@ -122,15 +208,20 @@ class InstructBlipDescriptor:
         The model is loaded in half precision mode on the GPU if available.
         """
 
-        self.model = InstructBlipForConditionalGeneration.from_pretrained(
-            "Salesforce/instructblip-vicuna-7b", torch_dtype=torch.float16
-        )
-        self.processor = InstructBlipProcessor.from_pretrained(
-            "Salesforce/instructblip-vicuna-7b", torch_dtype=torch.float16
+        path = "OpenGVLab/Mini-InternVL-Chat-4B-V1-5"
+        self.model = (
+            AutoModel.from_pretrained(
+                path,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+            )
+            .eval()
+            .cuda()
         )
 
+        self.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model.to(self.device)
 
     def load_db(self) -> None:
         """
@@ -186,7 +277,9 @@ class InstructBlipDescriptor:
         with open(self.db_path, "wb") as f:
             pickle.dump(self.db, f)
 
-    def process(self, image: Image.Image, prompt: str) -> Tuple[str, int]:
+    def process(
+        self, pixel_values_list: List[torch.Tensor], prompts: str
+    ) -> Tuple[str, int]:
         """
         Process the image with the specified prompt.
 
@@ -198,22 +291,24 @@ class InstructBlipDescriptor:
             Tuple[str, int]: The generated description and the number of generated tokens.
         """
 
-        inputs = self.processor(images=image, text=prompt, return_tensors="pt").to(
-            self.device
+        num_patches_list = [pixel_values.size(0) for pixel_values in pixel_values_list]
+        pixel_values_list = torch.cat(
+            [pixel_values.cuda() for pixel_values in pixel_values_list], dim=0
         )
 
-        outputs = self.model.generate(
-            **inputs,
-            **self.model_config,
+        responses = self.model.batch_chat(
+            self.tokenizer,
+            pixel_values_list,
+            num_patches_list=num_patches_list,
+            questions=prompts,
+            generation_config=self.model_config,
         )
-        decoded = self.processor.batch_decode(outputs, skip_special_tokens=True)
-        decoded_clean = []
+
         generated_tokens = 0
-        for i in range(len(prompt)):
-            generated_tokens += outputs[i].shape[0]
-            decoded_clean.append(decoded[i].strip())
+        for i in range(len(prompts)):
+            generated_tokens += len(responses[i].split(" "))
 
-        return decoded_clean, generated_tokens
+        return responses, generated_tokens
 
     def update_statistics(
         self, last_ckpt: float, generated_tokens: int
@@ -348,7 +443,7 @@ class InstructBlipDescriptor:
             keys = []
             images = []
             prompts = []
-            for _ in range(self.batch_size):
+            for i in range(self.batch_size):
                 if self.threaded_image_reader.is_iq_empty():
                     break
                 key, image = self.threaded_image_reader.image_queue.get()
@@ -356,11 +451,13 @@ class InstructBlipDescriptor:
                 images.append(image)
                 prompts.append(prompt)
 
-            descriptions, num_tokens = self.process(images, prompts)
+            description, num_tokens = self.process(images, prompts)
             self.image_count += self.batch_size
             generated_tokens += num_tokens
+            self.db["data"][key] = description
+
             for i, key in enumerate(keys):
-                self.db["data"][key] = descriptions[i]
+                self.db["data"][key] = description[i]
 
             for _ in range(self.batch_size):
                 try:
@@ -385,9 +482,10 @@ class InstructBlipDescriptor:
         self.save_db()
 
 
-if __name__ == "__main__":
-    prompt = "Provide an extended description on this image. Describe the pose (or stance) of the subject, how is the body arranged? Describe the outfit, the environment etc... Be thorough."
-    path = "/mnt/NAS/PoseDrawings/references_reworked_v2"
+prompt = "Provide an extended description on this image. Describe the pose (or stance) of the subject, how is the body arranged? Describe the outfit, the environment etc... Be thorough. [/INST]"
+path = "/mnt/NAS/PoseDrawings/references_reworked_v2"
 
-    db = InstructBlipDescriptor()
+
+if __name__ == "__main__":
+    db = InternVL15Descriptor()
     db.generate_descriptions(path, prompt)
